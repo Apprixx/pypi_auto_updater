@@ -19,6 +19,7 @@ class VersionChecker():
         从PyPI获取包的最新信息（手动重试机制）
         """
         url = f"https://pypi.org/pypi/{self.package_name}/json"
+        # url = f"https://pypi.tuna.tsinghua.edu.cn/pypi/{self.package_name}/json"
         max_retries = 3
         retry_delay = 1  # 初始延迟秒数
         
@@ -40,7 +41,7 @@ class VersionChecker():
                     continue
                 else:
                     log.error(f"获取 {self.package_name} 信息失败，已达到最大重试次数")
-                    return None, "Network Error"
+                    return None, "Network Error ConnectionError"
                     
             except requests.exceptions.Timeout as e:
                 log.warning(f"请求超时 ({attempt + 1}/{max_retries}): {e}")
@@ -49,7 +50,7 @@ class VersionChecker():
                     continue
                 else:
                     log.error(f"获取 {self.package_name} 信息失败，请求超时")
-                    return None, "Network Error"
+                    return None, "Network Error Timeout"
                     
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code in [429, 500, 502, 503, 504]:  # 可重试的HTTP错误
@@ -59,7 +60,10 @@ class VersionChecker():
                         continue
                     else:
                         log.error(f"获取 {self.package_name} 信息失败，HTTP错误")
-                        return None, "Network Error"
+                        return None, "Network Error HTTPError"
+                elif e.response.status_code in [404]:  # pypi官网无法识别包名称
+                    log.error(f"无法识别 {self.package_name}: {e}")
+                    return None, "404"
                 else:
                     # 其他HTTP错误（如404）不重试
                     log.error(f"获取 {self.package_name} 信息失败: {e}")

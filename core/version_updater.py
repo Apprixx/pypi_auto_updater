@@ -4,7 +4,6 @@ from datetime import datetime
 from utils.logger import log
 from core.platform_analyser import PlatformAnalyser
 
-
 """
 例子：
 pypi_info:
@@ -48,6 +47,30 @@ pypi_info:
 }
 """
 
+
+def my_version(text):
+    # 用于仅根据版本字符串生成可比较版本对象
+    # '0.7.1.fix1'
+    from packaging.version import Version
+
+    try:
+        v = Version(text)
+        return v
+    except Exception:
+        vs = (text or '').split('.')
+        if len(vs) > 3:
+            return my_version('.'.join(vs[:-1]))
+        else:
+            return None
+
+
+def get_version(filename):
+    # 根据python包文件名生成可比较版本对象
+    from packaging.utils import parse_sdist_filename
+
+    name, version = parse_sdist_filename(filename)
+    return version
+
 class VersionUpdater():
     def __init__(self, pypi_info, package_manager, package_name, status):
         if not status:
@@ -64,15 +87,33 @@ class VersionUpdater():
         """
         将旧版本到最新正式版之间所有版本（包括最新）添加到new_versions中
         """
-        # 获取所有键的列表
-        keys = list(self.releases.keys())
+        # 获取所有键的列表 按版本从低到高排序
+        # keys = list(self.releases.keys())
+        keys = sorted(
+            list(self.releases.keys()),
+            key=lambda v: my_version(v),
+            reverse=False
+        )
 
         # 找到旧版本和新版本的位置
-        start_index = keys.index(last_downloaded_version)
-        end_index = keys.index(self.latest_version)
-
-        # 获取这两个位置之间的所有键（包含最新正式版）
-        target_keys = keys[start_index + 1:end_index + 1]
+        if last_downloaded_version not in keys:
+            # 线上版本列表中不存在以往记录的版本
+            log.error('【{}】的线上版本列表【{}】中不存在上次成功下载的版本【{}】'.format(
+                self.package_name, ','.join([str(k) for k in keys]), last_downloaded_version
+                ))
+            # target_keys = keys[-1:]  # 出错情况下只下载最新版
+            # 出错情况下尝试计算一个大于上次上次版本的版本列表
+            get_versions = [v for v in keys if my_version(v) >= my_version(last_downloaded_version)]
+            if len(get_versions) == 0:  # 这种情况只能下载最新版了
+                target_keys = keys[-1:]
+            elif self.latest_version in get_versions:
+                end_index = keys.index(self.latest_version)
+                target_keys = get_versions[:end_index + 1]
+        else:
+            start_index = keys.index(last_downloaded_version)
+            end_index = keys.index(self.latest_version)
+            # 获取这两个位置之间的所有键（包含最新正式版）
+            target_keys = keys[start_index + 1:end_index + 1]
 
         # 返回新版本字典
         return {k: self.releases[k] for k in target_keys}

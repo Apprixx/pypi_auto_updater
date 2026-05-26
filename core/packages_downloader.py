@@ -9,10 +9,13 @@ from tqdm import tqdm
 from typing import Dict
 from utils.logger import log
 from config import PACKAGE_DOWNLOAD_THREADS
+import queue
 
 PACKAGES_JSON_PATH = "data/packages.json"
 DOWNLOAD_BASE_DIR = "data/packages"
 NUM_WORKERS = PACKAGE_DOWNLOAD_THREADS  # 下载线程数量
+
+tqdm.set_lock(threading.RLock())
 
 class PackagesDownloader:
     """
@@ -59,6 +62,8 @@ class PackagesDownloader:
             url: 下载地址
             sha256: 期望的SHA256哈希值
         """
+        import random
+
         target_dir = os.path.join(self.download_dir, package_name, version)
         os.makedirs(target_dir, exist_ok=True)
         file_path = os.path.join(target_dir, filename)
@@ -71,7 +76,63 @@ class PackagesDownloader:
                     h.update(chunk)
             return h.hexdigest()
 
-        MAX_RETRY = 3
+        # 20251121增加逻辑，检查【packages】中的【file_path】路径是否已存在目标文件，如果已存在，则检查sha256是否准确
+        if os.path.exists(file_path):            
+            if sha256:  # 验证哈希
+                file_hash = calc_sha256(file_path)
+                if file_hash.lower() == sha256.lower():
+                    log.debug(f"文件已存在且验证sha256通过：{filename}")
+                    return True
+            else:  # 如果无需验证sha256
+                log.debug(f"文件已存在：{filename}，直接使用")
+                return True
+
+        # 20251122增加逻辑，先从镜像源下载，3次失败后再使用官方pypi源
+        mirrors = ['https://mirrors.ustc.edu.cn/pypi/packages/', 'https://mirrors.cloud.tencent.com/pypi/packages/',
+                   'https://repo.huaweicloud.com/repository/pypi/packages/', 'https://mirrors.aliyun.com/pypi/packages/',
+                   'https://pypi.tuna.tsinghua.edu.cn/packages/']
+
+        # for i, mirror in enumerate(mirrors):  # 20251123修改为顺序尝试每个镜像网站
+        for i, mirror in enumerate(random.sample(mirrors, len(mirrors))):  # 20260218修改为随机尝试每个镜像网站            
+            # print(mirror)
+            mirrors_url = url.replace('https://files.pythonhosted.org/packages/', mirror)
+
+            MAX_RETRY = 3
+            for attempt in range(1, MAX_RETRY + 1):
+                try:
+                    # log.debug(f"线程 {thread_name} 第({attempt}/{MAX_RETRY})次尝试从镜像站下载 {filename}")
+                    response = requests.get(mirrors_url, stream=True, timeout=15)
+                    response.raise_for_status()
+
+                    with open(file_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+
+                    # 验证哈希
+                    if sha256:
+                        file_hash = calc_sha256(file_path)
+                        if file_hash.lower() != sha256.lower():
+                            # raise ValueError(f"哈希不匹配 (expected {sha256}, got {file_hash})")
+                            break  # 镜像站下载的文件如何hash检验失败，则继续从原始站点下载
+
+                    log.debug(f"线程 {thread_name} 成功从镜像站下载并验证 {filename}")
+
+                    return True
+
+                except Exception as e:
+                    # log.warning(f"线程 {thread_name} 从镜像站下载下载 {filename} 第 {attempt} 次失败: {e}")
+                    if os.path.exists(file_path):
+                        try:
+                            os.remove(file_path)
+                        except OSError:
+                            log.warning(f"无法删除损坏文件 {file_path}")
+                    if attempt < MAX_RETRY:
+                        continue
+                    else:
+                        log.error(f"线程 {thread_name} 从第{i+1}个镜像站下载下载 {filename} 连续失败 {MAX_RETRY} 次，放弃")
+                        break
+
         for attempt in range(1, MAX_RETRY + 1):
             try:
                 log.debug(f"线程 {thread_name} 第({attempt}/{MAX_RETRY})次尝试下载 {filename}")
@@ -91,11 +152,6 @@ class PackagesDownloader:
 
                 log.debug(f"线程 {thread_name} 成功下载并验证 {filename}")
 
-                # 更新进度条
-                with self.lock:
-                    if self.progress:
-                        self.progress.update(1)
-
                 return True
 
             except Exception as e:
@@ -109,49 +165,114 @@ class PackagesDownloader:
                     continue
                 else:
                     log.error(f"线程 {thread_name} 下载 {filename} 连续失败 {MAX_RETRY} 次，放弃")
-
-                    # 更新进度条
-                    with self.lock:
-                        if self.progress:
-                            self.progress.update(1)
                             
                     return False
 
 
-    def worker_thread(self, worker_id: int, packages_data: dict):
-        """工作线程函数，处理分配的包"""
+    # def worker_thread(self, worker_id: int, packages_data: dict):
+    #     """工作线程函数，处理分配的包"""
+
+    #     thread_name = f"Worker-{worker_id}"
+    #     for package_name, info in packages_data.items():
+    #         last_downloaded_version = info["last_downloaded_version"]
+    #         failed = False  # 标记包是否失败
+    #         version = 'not_vervison'  # 表示接口未返回有效版本
+    #         for version, releases in info["latest_releases"].items():
+    #             for filename, file_info in releases.items():
+    #                 success = self.download_package(thread_name, package_name, version, filename, file_info["url"], file_info["sha256"])
+    #                 if not success:
+    #                     failed = True
+    #                     break  # 任意文件失败，跳出当前版本循环
+    #                 else:
+    #                     last_downloaded_version = version
+    #             if failed:
+    #                 break  # 任意文件失败，跳出所有版本循环
+
+    #         # 下载完该包后处理状态
+    #         package_dir = os.path.join(self.download_dir, package_name, version)
+    #         with self.lock:
+    #             if failed:
+    #                 # 删除下载失败的版本的目录，并保持 status 为 outdated
+    #                 if os.path.exists(package_dir):
+    #                     shutil.rmtree(package_dir)
+    #                     log.warning(f"线程 {thread_name} 下载 {package_name} 失败，保留版本 {last_downloaded_version} ，状态 outdated")
+    #             else:
+    #                 # 全部文件下载成功，更新 status
+    #                 info['status'] = 'up_to_date'
+    #                 log.debug(f"线程 {thread_name} 下载 {package_name} 成功，状态 up_to_date")
+    #             info['last_downloaded_version'] = last_downloaded_version
+                
+    #             # 更新进度条
+    #             if self.progress:
+    #                 self.progress.update(1)
+
+    #     log.info(f"{thread_name} 完成所有任务")
+    
+
+    def worker_thread(self, worker_id: int, task_queue):
+        """工作线程函数，从任务队列中不断获取包进行下载"""
 
         thread_name = f"Worker-{worker_id}"
-        for package_name, info in packages_data.items():
-            last_downloaded_version = info["last_downloaded_version"]
-            failed = False  # 标记包是否失败
-            for version, releases in info["latest_releases"].items():
-                for filename, file_info in releases.items():
-                    success = self.download_package(thread_name, package_name, version, filename, file_info["url"], file_info["sha256"])
-                    if not success:
-                        failed = True
-                        break  # 任意文件失败，跳出当前版本循环
-                    else:
-                        last_downloaded_version = version
-                if failed:
-                    break  # 任意文件失败，跳出所有版本循环
 
-            # 下载完该包后处理状态
-            package_dir = os.path.join(self.download_dir, package_name, version)
-            with self.lock:
-                if failed:
-                    # 删除下载失败的版本的目录，并保持 status 为 outdated
-                    if os.path.exists(package_dir):
-                        shutil.rmtree(package_dir)
-                        log.warning(f"线程 {thread_name} 下载 {package_name} 失败，保留版本 {last_downloaded_version} ，状态 outdated")
-                else:
-                    # 全部文件下载成功，更新 status
-                    info['status'] = 'up_to_date'
-                    log.debug(f"线程 {thread_name} 下载 {package_name} 成功，状态 up_to_date")
-                info['last_downloaded_version'] = last_downloaded_version
+        while True:
+            try:
+                package_name, info = task_queue.get_nowait()
+            except queue.Empty:
+                break  # 队列空了，线程结束
+
+            last_downloaded_version = info["last_downloaded_version"]
+            failed = False
+            version = 'not_vervison'  # 表示接口未返回有效版本
+
+            try:
+                for version, releases in info["latest_releases"].items():
+                    for filename, file_info in releases.items():
+                        success = self.download_package(
+                            thread_name,
+                            package_name,
+                            version,
+                            filename,
+                            file_info["url"],
+                            file_info["sha256"]
+                        )
+
+                        if not success:
+                            failed = True
+                            break  # 任意文件失败，跳出当前版本循环
+
+                        else:
+                            last_downloaded_version = version
+
+                    if failed:
+                        break  # 任意包失败，跳出所有版本循环
+
+                # 下载完该包后处理状态
+                package_dir = os.path.join(self.download_dir, package_name, version)
+
+                with self.lock:
+                    if failed:
+                        if os.path.exists(package_dir):
+                            shutil.rmtree(package_dir)
+                            log.warning(
+                                f"线程 {thread_name} 下载 {package_name} 失败，保留版本 {last_downloaded_version} ，状态 outdated"
+                            )
+                    else:
+                        info['status'] = 'up_to_date'
+                        log.debug(
+                            f"线程 {thread_name} 下载 {package_name} 成功，状态 up_to_date"
+                        )
+
+                    info['last_downloaded_version'] = last_downloaded_version
+
+                    if self.progress:
+                        self.progress.update(1)
+
+            finally:
+                task_queue.task_done()
 
         log.info(f"{thread_name} 完成所有任务")
-    
+
+
     def clear_directory(self, folder_path: str = "data/packages") -> bool:
         """
         删除目录下所有内容，保留目录
@@ -173,72 +294,126 @@ class PackagesDownloader:
             log.error(f"清空目录失败 {folder_path}: {e}")
             return False
 
+    # def download_outdated_packages(self):
+    #     """
+    #     多线程下载所有 status 为 outdated 的包
+    #     """
+
+    #     # 20251121取消下载前的：清除所有旧数据
+    #     # self.clear_directory()
+           
+    #     # 筛选所有 outdated 包
+    #     outdated_packages = {name: info for name, info in self.packages_data.items() 
+    #                 if info.get("status") == "outdated"}
+        
+
+    #     # 统计需要下载的包总数
+    #     total_packages = len(outdated_packages)
+
+    #     # 创建全局进度条
+    #     self.progress = tqdm(total=total_packages, desc="下载进度", ncols=80)
+
+        
+    #     """
+    #     将字典按键平均分配到多个列表中
+    #     """
+    #     all_keys = list(outdated_packages.keys())
+    #     total_items = len(all_keys)
+    #     items_per_worker = total_items // NUM_WORKERS
+    #     remainder = total_items % NUM_WORKERS
+        
+    #     workloads = []
+    #     start_idx = 0
+        
+    #     for i in range(NUM_WORKERS):
+    #         # 计算当前线程应该处理的项目数
+    #         current_items = items_per_worker + (1 if i < remainder else 0)
+    #         end_idx = start_idx + current_items
+            
+    #         # 提取对应的键，然后构建子字典
+    #         worker_keys = all_keys[start_idx:end_idx]
+    #         worker_dict = {k: outdated_packages[k] for k in worker_keys}
+    #         workloads.append(worker_dict)
+            
+    #         start_idx = end_idx
+
+
+    #     log.info("=" * 50)
+    #     log.info("开始多线程包下载")
+    #     log.info(f"工作分配: {len(workloads)} 线程")
+    #     log.info("=" * 50)
+        
+    #     # 创建并启动工作线程
+    #     threads = []
+    #     start_time = time.time()
+        
+    #     for i, workload in enumerate(workloads):
+    #         if workload:  # 只创建有工作的线程
+    #             thread = threading.Thread(
+    #                 target=self.worker_thread,
+    #                 args=(i + 1, workload,)
+    #             )
+    #             threads.append(thread)
+    #             thread.start()
+        
+    #     # 等待所有工作线程完成
+    #     for thread in threads:
+    #         thread.join()
+
+    #     end_time = time.time()
+    #     log.info(f"多线程处理完成，耗时: {end_time - start_time:.2f}秒")
+
+    #     # 所有包下载完成后保存数据
+    #     self.save_packages()
+
     def download_outdated_packages(self):
         """
         多线程下载所有 status 为 outdated 的包
         """
 
-        # 清除所有旧数据
-        self.clear_directory()
-           
         # 筛选所有 outdated 包
-        outdated_packages = {name: info for name, info in self.packages_data.items() 
-                    if info.get("status") == "outdated"}
-        
+        outdated_packages = {
+            name: info for name, info in self.packages_data.items()
+            if info.get("status") == "outdated"
+        }
 
-        # 统计需要下载的文件总数
-        total_files = 0
-        for info in outdated_packages.values():
-            for version, releases in info["latest_releases"].items():
-                total_files += len(releases)
+        # 统计需要下载的包总数
+        total_packages = len(outdated_packages)
 
         # 创建全局进度条
-        self.progress = tqdm(total=total_files, desc="下载进度", ncols=80)
+        self.progress = tqdm(total=total_packages, desc="下载进度", ncols=80)
 
-        
-        """
-        将字典按键平均分配到多个列表中
-        """
-        all_keys = list(outdated_packages.keys())
-        total_items = len(all_keys)
-        items_per_worker = total_items // NUM_WORKERS
-        remainder = total_items % NUM_WORKERS
-        
-        workloads = []
-        start_idx = 0
-        
-        for i in range(NUM_WORKERS):
-            # 计算当前线程应该处理的项目数
-            current_items = items_per_worker + (1 if i < remainder else 0)
-            end_idx = start_idx + current_items
-            
-            # 提取对应的键，然后构建子字典
-            worker_keys = all_keys[start_idx:end_idx]
-            worker_dict = {k: outdated_packages[k] for k in worker_keys}
-            workloads.append(worker_dict)
-            
-            start_idx = end_idx
+        # 创建任务队列
+        task_queue = queue.Queue()
 
+        # 体积大的包先下载
+        sorted_pkgs = sorted(
+            outdated_packages.items(),
+            key=lambda x: x[1].get("size", 0),
+            reverse=True
+        )
+
+        for name, info in sorted_pkgs:
+            task_queue.put((name, info))
 
         log.info("=" * 50)
         log.info("开始多线程包下载")
-        log.info(f"工作分配: {len(workloads)} 线程")
+        log.info(f"任务总数: {task_queue.qsize()} 线程数: {NUM_WORKERS}")
         log.info("=" * 50)
-        
-        # 创建并启动工作线程
+
         threads = []
         start_time = time.time()
-        
-        for i, workload in enumerate(workloads):
-            if workload:  # 只创建有工作的线程
-                thread = threading.Thread(
-                    target=self.worker_thread,
-                    args=(i + 1, workload,)
-                )
-                threads.append(thread)
-                thread.start()
-        
-        # 等待所有工作线程完成
+
+        # 启动固定数量线程
+        for i in range(NUM_WORKERS):
+            thread = threading.Thread(
+                target=self.worker_thread,
+                args=(i + 1, task_queue)
+            )
+            threads.append(thread)
+            thread.start()
+
+        # 等待所有线程完成
         for thread in threads:
             thread.join()
 

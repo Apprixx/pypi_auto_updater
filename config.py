@@ -26,6 +26,12 @@ ALLOW_UNKNOWN_PLATFORM_DOWNLOAD = True
 # 开关SSL验证
 VERIFY_SSL = False
 
+# 是否跳过上次检查时遭遇404的包，因为这通常代表pypi官网不识别包名称，所以无需再进行版本检查和下载操作
+DROP404 = True
+
+# 如果当天没有下载成功的包文件，就不生成空压缩包
+SKIP_EMPTY_ZIP = True
+
 # windows计划任务每天运行时间
 START_TIME = "03:00"
 
